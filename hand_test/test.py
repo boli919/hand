@@ -5,6 +5,7 @@ from typing import Optional, List, Tuple
 import torch
 import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"]="1,2,3"
 from pathlib import Path
 import rerun as rr
 from tqdm import tqdm
@@ -31,7 +32,7 @@ from hamer.utils.renderer import Renderer, cam_crop_to_full
 from hamer.utils.render_openpose import render_hand_keypoints, render_openpose
 # import hamer.utils.render_openpose 
 import cProfile
-os.environ["CUDA_VISIBLE_DEVICES"]="1,2,3"
+
 openpose_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 gt_indices = openpose_indices
 # 以下为手部关键点检测和绘制需要的依赖
@@ -97,6 +98,7 @@ def get_camera_projection_from_device_point(
 ) -> Optional[np.ndarray]:
     # print(f"received point:{point}")
     T_device_camera = camera_calibration.get_transform_device_camera()
+    # print(camera_calibration)
     # print(f"required type:{type(T_device_camera.inverse() @ point)}")
     return camera_calibration.project(T_device_camera.inverse() @ point)
 
@@ -111,10 +113,12 @@ def log_hand_tracking(
     future_interval_seconds: float = 1.0,
     num_samples: int = 10,
 ) -> str:
+    # print(f"left and right:{wrist_and_palm_poses.keys()}")
     if not wrist_and_palm_poses:
         return json.dumps({"left_hand": [], "right_hand": []}, indent=2)
 
     wrist_and_palm_pose = get_nearest_wrist_and_palm_pose(wrist_and_palm_poses, device_time_ns)
+    # print(f"keys:{wrist_and_palm_pose.keys()}")
     if wrist_and_palm_pose is None:
         return json.dumps({"left_hand": [], "right_hand": []}, indent=2)
 
@@ -128,14 +132,16 @@ def log_hand_tracking(
     T_world_device_current = current_pose_info.transform_world_device
 
     # Process left hand
-    if wrist_and_palm_pose.left_hand and wrist_and_palm_pose.left_hand.confidence > 0:
+    # print(f"left:{wrist_and_palm_pose.left_hand}")
+    if wrist_and_palm_pose.left_hand and wrist_and_palm_pose.left_hand.confidence >= 0:
         left_wrist_point_device = wrist_and_palm_pose.left_hand.wrist_position_device
         left_wrist_pixel = get_camera_projection_from_device_point(left_wrist_point_device, rgb_camera_calibration)
+        # print(f"left:{left_wrist_pixel}")
 
         if left_wrist_pixel is not None:
             scaled_point = [p / down_sampling_factor for p in left_wrist_pixel]
             left_hand_points.append(scaled_point)
-
+            
     # Process right hand
     if wrist_and_palm_pose.right_hand and wrist_and_palm_pose.right_hand.confidence > 0:
         right_wrist_point_device = wrist_and_palm_pose.right_hand.wrist_position_device
@@ -192,7 +198,7 @@ def log_hand_tracking(
             {"wrist_point": point} for point in right_hand_points
         ] if len(right_hand_points) >= 2 else [],
     }
-
+    # print(f"result:{result}")
     result_json = json.dumps(result, indent=2)
     # print(f"hand projections:{result_json}")
     return result_json
@@ -267,24 +273,26 @@ def detect_and_draw_hands(
     model_cfg,
     detector,
     cpm,
-    
     hand_projections: Optional[str] = None,
     renderer=None,
-    device= None,
+    device=None,
 ) -> np.ndarray:   
     """
-    使用HAMER检测手部关键点并绘制
+    使用HAMER检测手部关键点并绘制，使用实际手腕点替换检测的手腕点
     """
-    # 添加手部轨迹
-    # print(hand_projections)
     img_copy = img.copy()
+    left_wrist_point = None
+    right_wrist_point = None
+    
+    # 获取实际手腕点坐标
     if hand_projections:
         try:
             hand_data = json.loads(hand_projections)
-            # print(hand_data)
-            # 绘制左手轨迹
+            
+            # 获取左手最新的手腕点
             left_hand_points = hand_data.get("left_hand", [])
             if left_hand_points:
+                left_wrist_point = left_hand_points[0]["wrist_point"]
                 for point in left_hand_points:
                     wrist_point = point["wrist_point"]
                     x, y = wrist_point[0], wrist_point[1]
@@ -298,9 +306,10 @@ def detect_and_draw_hands(
                             (int(curr_point[0]), int(curr_point[1])),
                             (255, 255, 0), 3)
             
-            # 绘制右手轨迹
+            # 获取右手最新的手腕点
             right_hand_points = hand_data.get("right_hand", [])
             if right_hand_points:
+                right_wrist_point = right_hand_points[0]["wrist_point"]
                 for point in right_hand_points:
                     wrist_point = point["wrist_point"]
                     x, y = wrist_point[0], wrist_point[1]
@@ -316,26 +325,17 @@ def detect_and_draw_hands(
                             
         except Exception as e:
             print(f"Error processing hand projections: {e}")
-
-    #这里看一下img的文件类型，想一想在每次识别手之后进行3d替换，是不是把matrix也拿过来？
     
-    # device = next(model.parameters()).device
     img_cv2 = cv2.cvtColor(img_copy, cv2.COLOR_RGB2BGR)
     
-    # #测试坐标转换
-    # test_point = np.array([0,0,1], dtype=np.float64)
-    # test_projection = get_camera_projection_from_device_point(test_point, camera_calibration)
-    # print(f"Test projection result: {test_projection}")
-
     det_out = detector(img_cv2)
     img = img_cv2.copy()[:, :, ::-1]
 
     det_instances = det_out['instances']
     valid_idx = (det_instances.pred_classes==0) & (det_instances.scores > 0.5)
-    pred_bboxes=det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
-    pred_scores=det_instances.scores[valid_idx].cpu().numpy()
+    pred_bboxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
+    pred_scores = det_instances.scores[valid_idx].cpu().numpy()
 
-    # Detect human keypoints for each person
     vitposes_out = cpm.predict_pose(
         img_cv2,
         [np.concatenate([pred_bboxes, pred_scores[:, None]], axis=1)],
@@ -344,33 +344,67 @@ def detect_and_draw_hands(
     bboxes = []
     is_right = []
 
-        # Use hands based on hand keypoint detections
     for vitposes in vitposes_out:
+        # Initialize variables for both hands
+        left_hand_bbox = None
+        right_hand_bbox = None
+        left_max_conf = 0
+        right_max_conf = 0
+        
+        # Process left hand keypoints
         left_hand_keyp = vitposes['keypoints'][-42:-21]
+        valid_left = left_hand_keyp[:,2] > 0.5
+        if sum(valid_left) > 3:
+            conf = np.mean(left_hand_keyp[valid_left, 2])
+            if conf > left_max_conf:
+                left_max_conf = conf
+                left_hand_bbox = [
+                    left_hand_keyp[valid_left,0].min(),
+                    left_hand_keyp[valid_left,1].min(),
+                    left_hand_keyp[valid_left,0].max(),
+                    left_hand_keyp[valid_left,1].max()
+                ]
+        
+        # Process right hand keypoints
         right_hand_keyp = vitposes['keypoints'][-21:]
+        valid_right = right_hand_keyp[:,2] > 0.5
+        if sum(valid_right) > 3:
+            conf = np.mean(right_hand_keyp[valid_right, 2])
+            if conf > right_max_conf:
+                right_max_conf = conf
+                right_hand_bbox = [
+                    right_hand_keyp[valid_right,0].min(),
+                    right_hand_keyp[valid_right,1].min(),
+                    right_hand_keyp[valid_right,0].max(),
+                    right_hand_keyp[valid_right,1].max()
+                ]
 
-        # Rejecting not confident detections
-        keyp = left_hand_keyp
-        valid = keyp[:,2] > 0.5
-        if sum(valid) > 3:
-            bbox = [keyp[valid,0].min(), keyp[valid,1].min(), keyp[valid,0].max(), keyp[valid,1].max()]
-            bboxes.append(bbox)
+        # Add valid bboxes to the lists
+        if left_hand_bbox is not None:
+            bboxes.append(left_hand_bbox)
             is_right.append(0)
-        keyp = right_hand_keyp
-        valid = keyp[:,2] > 0.5
-        if sum(valid) > 3:
-            bbox = [keyp[valid,0].min(), keyp[valid,1].min(), keyp[valid,0].max(), keyp[valid,1].max()]
-            bboxes.append(bbox)
+        if right_hand_bbox is not None:
+            bboxes.append(right_hand_bbox)
             is_right.append(1)
 
-    # if len(bboxes) == 0:
-    #     continue
+    if len(bboxes) == 0:
+        print("No valid bounding boxes detected. Returning original image.")
+        return img_copy
+
     boxes = np.stack(bboxes)
     right = np.stack(is_right)
-
-    # Run reconstruction on all detected hands
+    
     dataset = ViTDetDataset(model_cfg, img_cv2, boxes, right, rescale_factor=2.0)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=800, shuffle=False, num_workers=0)
+    dataloader = torch.utils.data.DataLoader(
+        dataset, 
+        batch_size=8, 
+        shuffle=False, 
+        num_workers=0,
+        pin_memory=True
+    )
+
+    # Rest of your function remains the same...
+    # [Previous code for processing predictions and drawing remains unchanged]
 
     all_verts = []
     all_cam_t = []
@@ -378,7 +412,6 @@ def detect_and_draw_hands(
     all_vit_2d = []
     all_pred_2d = []
     all_bboxes = []
-    #按批次处理手部图像
 
     for batch in dataloader:
         batch = recursive_to(batch, device)
@@ -391,46 +424,44 @@ def detect_and_draw_hands(
         box_center = batch["box_center"].float()
         box_size = batch["box_size"].float()
         img_size = batch["img_size"].float()
-        multiplier = (2*batch['right']-1)
         scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
-        # print(scaled_focal_length, model_cfg.EXTRA.FOCAL_LENGTH, model_cfg.MODEL.IMAGE_SIZE, img_size.max())
-        pred_cam_t_full = cam_crop_to_full(pred_cam, box_center, box_size, img_size, scaled_focal_length)#.detach().cpu().numpy()
+        pred_cam_t_full = cam_crop_to_full(pred_cam, box_center, box_size, img_size, scaled_focal_length)
 
-        # Render the result，before passing to project
         batch_size = batch['img'].shape[0]
            
         pred_keypoints_3d = out['pred_keypoints_3d'].reshape(batch_size, -1, 3)
-        # Process each set of keypoints
         for i in range(batch_size):
-            # 获取当前手的 multiplier
             current_multiplier = multiplier[i]
-            # 只修改当前手的 x 坐标
             pred_keypoints_3d[i,:,0] = current_multiplier * pred_keypoints_3d[i,:,0]
-            # pred_keypoints_3d=pred_keypoints_3d[:2, :, :]
-            # print(f"3d:{pred_keypoints_3d}")
-            #这里batch size是手的个数
+
         out['pred_keypoints_2d'] = perspective_projection(pred_keypoints_3d,
                                     translation=pred_cam_t_full.reshape(batch_size, 3),
                                     focal_length=torch.tensor([[scaled_focal_length, scaled_focal_length]]),
-                                    camera_center=torch.tensor([704,704]))# out['focal_length'].reshape(-1, 2) / model_cfg.MODEL.IMAGE_SIZE)
-        # print(f"2dpoint:{out['pred_keypoints_2d']}")
+                                    camera_center=torch.tensor([703.5,703.5]))
+        
         pred_cam_t_full = pred_cam_t_full.detach().cpu().numpy()
+        
         for n in range(batch_size):
-            # Get filename from path img_path
-            # img_fn, _ = os.path.splitext(os.path.basename(img_path))
             person_id = int(batch['personid'][n])
             white_img = (torch.ones_like(batch['img'][n]).cpu() - DEFAULT_MEAN[:,None,None]/255) / (DEFAULT_STD[:,None,None]/255)
             input_patch = batch['img'][n].cpu() * (DEFAULT_STD[:,None,None]/255) + (DEFAULT_MEAN[:,None,None]/255)
             input_patch = input_patch.permute(1,2,0).numpy()
 
-
-            # Add all verts and cams to list
             verts = out['pred_vertices'][n].detach().cpu().numpy()
             pred_joints = out['pred_keypoints_2d'][n].detach().cpu().numpy()
-            print(f"2dpoint:{pred_joints}")
             is_right = int(batch['right'][n].cpu().numpy())
-            #这里不用转？
-            # pred_joints[:,0] = (2*is_right-1)*pred_joints[:,0]
+            
+            # 根据是否为右手替换手腕点坐标
+            if is_right and right_wrist_point is not None:
+                print(f"right")
+                pred_joints[0, 0] = right_wrist_point[0]  # x坐标
+                pred_joints[0, 1] = right_wrist_point[1]  # y坐标
+                
+            elif not is_right and left_wrist_point is not None:
+                print(f"left")
+                pred_joints[0, 0] = left_wrist_point[0]  # x坐标
+                pred_joints[0, 1] = left_wrist_point[1]  # y坐标
+            
             v = np.ones((21, 1))
             pred_joints = np.concatenate((pred_joints, v), axis=-1)
             verts[:,0] = (2*is_right-1)*verts[:,0]
@@ -439,21 +470,32 @@ def detect_and_draw_hands(
             all_cam_t.append(cam_t)
             all_right.append(is_right)
             all_pred_2d.append(pred_joints)
+            
     all_pred_2d = np.stack(all_pred_2d)
+
+    # 添加判断条件，舍弃第一行数据差值不超过5的点
+    to_remove = set()
+    for i in range(len(all_pred_2d)):
+        for j in range(i + 1, len(all_pred_2d)):
+            if np.abs(all_pred_2d[i, 0, 0] - all_pred_2d[j, 0, 0]) <= 5:
+                to_remove.add(j)
+
+    all_pred_2d = np.delete(all_pred_2d, list(to_remove), axis=0)
+
     input_img = img_cv2.astype(np.float32)[:,:,::-1]/255.0
     input_img = np.concatenate([input_img, np.ones_like(input_img[:,:,:1])], axis=2)
     pred_img = input_img.copy()[:,:,:-1][:,:,::-1] * 255
-    for i in range(len(all_verts)):
+    
+    for i in range(len(all_pred_2d)):
         body_keypoints_2d = all_pred_2d[i, :21].copy()
         for op, gt in zip(openpose_indices, gt_indices):
             if all_pred_2d[i, gt, -1] > body_keypoints_2d[op, -1]:
                 body_keypoints_2d[op] = all_pred_2d[i, gt]
         pred_img = render_openpose(pred_img, body_keypoints_2d)
-
-
-        
     
-    return pred_img
+    output_img = cv2.cvtColor(pred_img, cv2.COLOR_RGB2BGR)
+    
+    return output_img
 
 def log_RGB_image(
     data,
@@ -510,8 +552,8 @@ def main():
     model.eval()
     renderer = Renderer(model_cfg, faces=model.mano.faces)
 
-    vrs_path = "/data/borui/test/Cook-egg.vrs"  # 替换为你的vrs文件路径
-    mps_folder = "/data/borui/test/mps_Cook-egg_vrs"  # 替换为你的mps文件夹路径
+    vrs_path = "/data/borui/dataset/v2/P015_S1_002/ego/P015_S1_002.vrs"  # 替换为你的vrs文件路径
+    mps_folder = "/data/borui/dataset/v2/P015_S1_002/ego/mps_P015_S1_002_vrs"  # 替换为你的mps文件夹路径
     
     output_base_dir = "./output_frames"  # 所有帧的根输出目录
 
@@ -521,13 +563,15 @@ def main():
     for i in range(3):
         detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
     detector = DefaultPredictor_Lazy(detectron2_cfg)
-
-    cpm = ViTPoseModel(device)
+    #
+    device1=torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    cpm = ViTPoseModel(device1)
 
     provider = data_provider.create_vrs_data_provider(vrs_path)
     device_calibration = provider.get_device_calibration()
     T_device_CPF = device_calibration.get_transform_device_cpf()
     rgb_stream_id = StreamId("214-1")
+    
     rgb_stream_label = provider.get_label_from_stream_id(rgb_stream_id)
     rgb_camera_calibration = device_calibration.get_camera_calib(rgb_stream_label)
 
